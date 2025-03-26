@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import sys
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to prevent tkinter issues
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torchvision.utils as vutils
@@ -517,6 +519,11 @@ def visualize_codebook(model, device, output_dir):
 def main():
     args = parse_args()
     
+    # Set random seed for reproducible visualizations
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
     # Set device
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device(f"cuda:{args.gpu}" if use_cuda else "cpu")
@@ -543,17 +550,21 @@ def main():
     else:
         print(f"Checkpoint {args.checkpoint} not found, using random weights")
     
-    # Get data loader
+    # Get data loader with smaller batch size to avoid memory issues
     test_loader = get_data_loaders(
         data_path=args.data_path,
         batch_idx=args.batch_idx,
-        batch_size=args.num_samples,
+        batch_size=min(args.num_samples, 4),  # Limit batch size
         patch_size=args.patch_size,
         num_patches_h=args.num_patches_h,
         num_patches_w=args.num_patches_w,
-        num_workers=4,
+        num_workers=2,  # Reduce workers to limit memory usage
         is_test_set=True
     )
+    
+    # Make sure we have a clean state before starting
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+    plt.close('all')
     
     # Visualize reconstructions
     print("Generating reconstruction visualizations...")
@@ -591,6 +602,10 @@ def main():
         os.path.join(args.output_dir, 'sequence'),
         args.video_idx, args.start_frame, args.num_frames
     )
+    
+    # Final cleanup
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+    plt.close('all')
     
     print(f"All visualizations saved to {args.output_dir}")
 

@@ -1,0 +1,24 @@
+Batch 0 Processing Summary
+Total samples: 812
+Number of chunks: 4
+Chunk size: 203
+Model path: checkpoints_optimized/best_model_stage1.pt
+Device: cuda
+--------------------------------------------------
+
+Chunk 0 (0:203):
+  Status: Success
+  Mode: Full model
+
+Chunk 1 (203:406):
+  Status: Success
+  Mode: Full model
+
+Chunk 2 (406:609):
+  Status: Success
+  Mode: Full model
+
+Chunk 3 (609:812):
+  Status: Success
+  Mode: Full model
+

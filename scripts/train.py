@@ -48,7 +48,7 @@ def parse_args():
                         help='Restart unused embedding vectors during training')
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=1,
+    parser.add_argument('--batch_size', type=int, default=3,
                         help='Batch size for training')
     parser.add_argument('--epochs_per_batch', type=int, default=10,
                         help='Number of epochs to train on each data batch in stage 1')
@@ -316,20 +316,34 @@ def main():
     # After training on all batches, evaluate on the test set
     print("\n=== Evaluating on test set ===\n")
     
-    # Load the best GAN model if it exists, otherwise use the current model
+    # Load the best GAN model if it exists, otherwise try the stage1 model, or use the current model
     gan_best_path = os.path.join(args.checkpoint_dir, "best_model_gan.pt")
+    stage1_best_path = os.path.join(args.checkpoint_dir, "best_model_stage1.pt")
     disc_best_path = os.path.join(args.checkpoint_dir, "best_discriminator.pt")
     
-    if os.path.exists(gan_best_path) and os.path.exists(disc_best_path):
+    if os.path.exists(gan_best_path):
         print(f"Loading best GAN model from {gan_best_path}")
         model.load_state_dict(torch.load(gan_best_path, map_location=device))
-        discriminator.load_state_dict(torch.load(disc_best_path, map_location=device))
+    elif os.path.exists(stage1_best_path):
+        print(f"No GAN model found. Loading stage 1 model from {stage1_best_path}")
+        model.load_state_dict(torch.load(stage1_best_path, map_location=device))
+    else:
+        print("No saved models found. Using current model state.")
     
-    # Get test data loader
+    if os.path.exists(disc_best_path):
+        print(f"Loading best discriminator from {disc_best_path}")
+        discriminator.load_state_dict(torch.load(disc_best_path, map_location=device))
+    else:
+        print("No saved discriminator found. Using current discriminator state.")
+    
+    # Get test data loader with smaller batch size to save memory
+    test_batch_size = min(args.batch_size, 4)  # Use smaller batch size for testing
+    print(f"Using test batch size of {test_batch_size}")
+    
     test_loader = get_data_loaders(
         data_path=args.data_path,
         batch_idx=args.test_batch,
-        batch_size=args.batch_size,
+        batch_size=test_batch_size,
         patch_size=args.patch_size,
         num_patches_h=args.num_patches_h,
         num_patches_w=args.num_patches_w,
@@ -337,16 +351,27 @@ def main():
         is_test_set=True
     )
     
+    # Clean up memory before evaluation
+    gc.collect()
+    if use_cuda:
+        torch.cuda.empty_cache()
+    
     # Evaluate on test set
-    test_loss, test_recon, test_latent, usage = evaluate_on_test_set(
-        model=model,
-        discriminator=discriminator,
-        test_loader=test_loader,
-        device=device,
-        results_folder=os.path.join(args.results_dir, 'test'),
-        perceptual_weight=args.perceptual_weight,
-        adv_weight=args.adv_weight
-    )
+    try:
+        test_loss, test_recon, test_latent, usage = evaluate_on_test_set(
+            model=model,
+            discriminator=discriminator,
+            test_loader=test_loader,
+            device=device,
+            results_folder=os.path.join(args.results_dir, 'test'),
+            perceptual_weight=args.perceptual_weight,
+            adv_weight=args.adv_weight
+        )
+    except Exception as e:
+        print(f"Error during evaluation: {e}")
+        print("Continuing with training summary...")
+        test_loss, test_recon, test_latent = 0.0, 0.0, 0.0
+        usage = torch.zeros(args.num_embeddings) if hasattr(model, 'num_embeddings') else None
     
     print("\nTraining complete!")
     print(f"Best validation loss: {best_overall_val_loss:.6f}")

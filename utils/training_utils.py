@@ -8,6 +8,8 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 import lpips
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to prevent tkinter issues
 import matplotlib.pyplot as plt
 
 def save_image_grid(images, filepath, nrow=8, normalize=True, value_range=(-1, 1)):
@@ -78,6 +80,9 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
     # Setup loss functions
     perceptual_loss = PerceptualLoss().to(device)
     
+    # Setup mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    
     for epoch in range(num_epochs):
         model.train()
         train_losses = {
@@ -95,19 +100,37 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
             # Train the generator (VQ-VAE part)
             optimizer.zero_grad()
             
-            # Forward pass
-            reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
-            
-            # Calculate losses
-            recon_loss = F.mse_loss(reconstructions, images)
-            p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0)
-            
-            # Combined loss
-            loss = recon_loss + vq_loss + perceptual_weight * p_loss
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
+            # Use mixed precision for forward pass
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    # Forward pass
+                    reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                    
+                    # Calculate losses
+                    recon_loss = F.mse_loss(reconstructions, images)
+                    p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                    
+                    # Combined loss
+                    loss = recon_loss + vq_loss + perceptual_weight * p_loss
+                
+                # Backward pass with scaling
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Forward pass (no mixed precision)
+                reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                
+                # Calculate losses
+                recon_loss = F.mse_loss(reconstructions, images)
+                p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                
+                # Combined loss
+                loss = recon_loss + vq_loss + perceptual_weight * p_loss
+                
+                # Backward pass
+                loss.backward()
+                optimizer.step()
             
             # Update train losses
             train_losses['total'] += loss.item()
@@ -122,6 +145,9 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
                 'vq': f"{vq_loss.item():.4f}",
                 'p_loss': f"{p_loss.item():.4f}" if perceptual_weight > 0 else "0.0000"
             })
+            
+            # Clear memory
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
         
         # Calculate average train losses
         for key in train_losses:
@@ -141,15 +167,28 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
             for i, (images, _) in enumerate(val_loader):
                 images = images.to(device)
                 
-                # Forward pass
-                reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
-                
-                # Calculate losses
-                recon_loss = F.mse_loss(reconstructions, images)
-                p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0)
-                
-                # Combined loss
-                loss = recon_loss + vq_loss + perceptual_weight * p_loss
+                # Use mixed precision for validation as well (no gradient scaling needed)
+                if device.type == 'cuda':
+                    with torch.cuda.amp.autocast():
+                        # Forward pass
+                        reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                        
+                        # Calculate losses
+                        recon_loss = F.mse_loss(reconstructions, images)
+                        p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                        
+                        # Combined loss
+                        loss = recon_loss + vq_loss + perceptual_weight * p_loss
+                else:
+                    # Forward pass without mixed precision
+                    reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                    
+                    # Calculate losses
+                    recon_loss = F.mse_loss(reconstructions, images)
+                    p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                    
+                    # Combined loss
+                    loss = recon_loss + vq_loss + perceptual_weight * p_loss
                 
                 # Update val losses
                 val_losses['total'] += loss.item()
@@ -157,8 +196,11 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
                 val_losses['vq'] += vq_loss.item()
                 val_losses['perceptual'] += p_loss.item() if perceptual_weight > 0 else 0
                 
-                # Save some validation reconstructions
+                # Save some validation reconstructions (only for the first batch to save memory)
                 if i == 0:
+                    # Save at most 8 images or all available if < 8
+                    n_samples = min(8, images.shape[0])
+                    
                     reconstructions_path = os.path.join(
                         batch_results_folder, 
                         'reconstructions', 
@@ -166,8 +208,8 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
                     )
                     
                     # Combine original and reconstructed images
-                    comparison = torch.cat([images[:8], reconstructions[:8]], dim=0)
-                    grid = save_image_grid(comparison, reconstructions_path, nrow=8, value_range=(0, 1))
+                    comparison = torch.cat([images[:n_samples], reconstructions[:n_samples]], dim=0)
+                    grid = save_image_grid(comparison, reconstructions_path, nrow=n_samples, value_range=(0, 1))
                     writer.add_image(f'val/reconstructions', grid, epoch)
                     
                     # Save codebook usage visualization
@@ -186,6 +228,12 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
                         writer.add_scalar('codebook/usage_entropy', 
                                           -(usage / usage.sum() * np.log(usage / usage.sum() + 1e-10)).sum(), 
                                           epoch)
+                        
+                    # Make sure to close all matplotlib figures to avoid memory leaks
+                    plt.close('all')
+                
+                # Clear memory after each validation batch
+                torch.cuda.empty_cache() if device.type == 'cuda' else None
         
         # Calculate average val losses
         for key in val_losses:
@@ -209,6 +257,8 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
             best_val_loss = val_losses['total']
             checkpoint_path = os.path.join(checkpoint_dir, f'batch_{batch_idx}_best_model.pt')
             torch.save(model.state_dict(), checkpoint_path)
+            # Also save for overall best model
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_model_stage1.pt"))
             print(f"  New best model saved at {checkpoint_path}")
             
         # Save regular checkpoint
@@ -219,6 +269,10 @@ def train_vqgan_stage1(model, train_loader, val_loader, device, batch_idx,
     # Save final checkpoint
     final_checkpoint_path = os.path.join(checkpoint_dir, f'batch_{batch_idx}_final_checkpoint.pt')
     torch.save(model.state_dict(), final_checkpoint_path)
+    
+    # Ensure we clear memory before returning
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+    plt.close('all')
     
     return model, best_val_loss
 
@@ -243,6 +297,10 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
     # Setup loss functions
     perceptual_loss = PerceptualLoss().to(device)
     
+    # Setup mixed precision training
+    scaler_g = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    scaler_d = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    
     for epoch in range(num_epochs):
         model.train()
         discriminator.train()
@@ -260,53 +318,98 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
         
         for i, (images, _) in enumerate(progress_bar):
             images = images.to(device)
-            batch_size = images.size(0)
             
-            # Train discriminator
+            # Train discriminator with mixed precision
             optimizer_d.zero_grad()
             
-            # Get reconstructions
-            with torch.no_grad():
-                reconstructions, _, _, _ = model(images, return_perceptual=True)
-            
-            # Real images
-            real_preds = discriminator(images)
-            real_targets = torch.ones_like(real_preds)
-            loss_d_real = F.binary_cross_entropy_with_logits(real_preds, real_targets)
-            
-            # Fake images (reconstructions)
-            fake_preds = discriminator(reconstructions.detach())
-            fake_targets = torch.zeros_like(fake_preds)
-            loss_d_fake = F.binary_cross_entropy_with_logits(fake_preds, fake_targets)
-            
-            # Combined discriminator loss
-            loss_d = 0.5 * (loss_d_real + loss_d_fake)
-            loss_d.backward()
-            optimizer_d.step()
+            if scaler_d is not None:
+                with torch.cuda.amp.autocast():
+                    # Get reconstructions
+                    with torch.no_grad():
+                        reconstructions, _, _, _ = model(images, return_perceptual=True)
+                    
+                    # Real images
+                    real_preds = discriminator(images)
+                    real_targets = torch.ones_like(real_preds)
+                    loss_d_real = F.binary_cross_entropy_with_logits(real_preds, real_targets)
+                    
+                    # Fake images (reconstructions)
+                    fake_preds = discriminator(reconstructions.detach())
+                    fake_targets = torch.zeros_like(fake_preds)
+                    loss_d_fake = F.binary_cross_entropy_with_logits(fake_preds, fake_targets)
+                    
+                    # Combined discriminator loss
+                    loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                
+                # Scale the gradients and update
+                scaler_d.scale(loss_d).backward()
+                scaler_d.step(optimizer_d)
+                scaler_d.update()
+            else:
+                # No mixed precision
+                with torch.no_grad():
+                    reconstructions, _, _, _ = model(images, return_perceptual=True)
+                
+                # Real images
+                real_preds = discriminator(images)
+                real_targets = torch.ones_like(real_preds)
+                loss_d_real = F.binary_cross_entropy_with_logits(real_preds, real_targets)
+                
+                # Fake images (reconstructions)
+                fake_preds = discriminator(reconstructions.detach())
+                fake_targets = torch.zeros_like(fake_preds)
+                loss_d_fake = F.binary_cross_entropy_with_logits(fake_preds, fake_targets)
+                
+                # Combined discriminator loss
+                loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                loss_d.backward()
+                optimizer_d.step()
             
             train_losses['adv_d'] += loss_d.item()
             
-            # Train generator (VQ-GAN)
+            # Train generator (VQ-GAN) with mixed precision
             optimizer_g.zero_grad()
             
-            # Forward pass
-            reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
-            
-            # Calculate losses
-            recon_loss = F.mse_loss(reconstructions, images)
-            p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0)
-            
-            # Adversarial loss (fool the discriminator)
-            fake_preds = discriminator(reconstructions)
-            real_targets = torch.ones_like(fake_preds)
-            adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
-            
-            # Combined generator loss
-            loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
-            
-            # Backward pass
-            loss_g.backward()
-            optimizer_g.step()
+            if scaler_g is not None:
+                with torch.cuda.amp.autocast():
+                    # Forward pass
+                    reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                    
+                    # Calculate losses
+                    recon_loss = F.mse_loss(reconstructions, images)
+                    p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                    
+                    # Adversarial loss (fool the discriminator)
+                    fake_preds = discriminator(reconstructions)
+                    real_targets = torch.ones_like(fake_preds)
+                    adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
+                    
+                    # Combined generator loss
+                    loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
+                
+                # Scale the gradients and update
+                scaler_g.scale(loss_g).backward()
+                scaler_g.step(optimizer_g)
+                scaler_g.update()
+            else:
+                # Forward pass without mixed precision
+                reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                
+                # Calculate losses
+                recon_loss = F.mse_loss(reconstructions, images)
+                p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                
+                # Adversarial loss (fool the discriminator)
+                fake_preds = discriminator(reconstructions)
+                real_targets = torch.ones_like(fake_preds)
+                adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
+                
+                # Combined generator loss
+                loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
+                
+                # Backward pass and update
+                loss_g.backward()
+                optimizer_g.step()
             
             # Update train losses
             train_losses['total_g'] += loss_g.item()
@@ -322,6 +425,9 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
                 'recon': f"{recon_loss.item():.4f}",
                 'vq': f"{vq_loss.item():.4f}"
             })
+            
+            # Clear memory after each batch
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
         
         # Calculate average train losses
         for key in train_losses:
@@ -344,31 +450,57 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
         with torch.no_grad():
             for i, (images, _) in enumerate(val_loader):
                 images = images.to(device)
-                batch_size = images.size(0)
                 
-                # Forward pass
-                reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
-                
-                # Calculate losses
-                recon_loss = F.mse_loss(reconstructions, images)
-                p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0)
-                
-                # Discriminator evaluation
-                real_preds = discriminator(images)
-                real_targets = torch.ones_like(real_preds)
-                loss_d_real = F.binary_cross_entropy_with_logits(real_preds, real_targets)
-                
-                fake_preds = discriminator(reconstructions)
-                fake_targets = torch.zeros_like(fake_preds)
-                loss_d_fake = F.binary_cross_entropy_with_logits(fake_preds, fake_targets)
-                
-                loss_d = 0.5 * (loss_d_real + loss_d_fake)
-                
-                # Generator adversarial loss
-                adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
-                
-                # Combined generator loss
-                loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
+                # Use mixed precision for validation as well
+                if device.type == 'cuda':
+                    with torch.cuda.amp.autocast():
+                        # Forward pass
+                        reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                        
+                        # Calculate losses
+                        recon_loss = F.mse_loss(reconstructions, images)
+                        p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                        
+                        # Discriminator evaluation
+                        real_preds = discriminator(images)
+                        real_targets = torch.ones_like(real_preds)
+                        loss_d_real = F.binary_cross_entropy_with_logits(real_preds, real_targets)
+                        
+                        fake_preds = discriminator(reconstructions)
+                        fake_targets = torch.zeros_like(fake_preds)
+                        loss_d_fake = F.binary_cross_entropy_with_logits(fake_preds, fake_targets)
+                        
+                        loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                        
+                        # Generator adversarial loss
+                        adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
+                        
+                        # Combined generator loss
+                        loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
+                else:
+                    # Forward pass without mixed precision
+                    reconstructions, quantized, vq_loss, perceptual = model(images, return_perceptual=True)
+                    
+                    # Calculate losses
+                    recon_loss = F.mse_loss(reconstructions, images)
+                    p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                    
+                    # Discriminator evaluation
+                    real_preds = discriminator(images)
+                    real_targets = torch.ones_like(real_preds)
+                    loss_d_real = F.binary_cross_entropy_with_logits(real_preds, real_targets)
+                    
+                    fake_preds = discriminator(reconstructions)
+                    fake_targets = torch.zeros_like(fake_preds)
+                    loss_d_fake = F.binary_cross_entropy_with_logits(fake_preds, fake_targets)
+                    
+                    loss_d = 0.5 * (loss_d_real + loss_d_fake)
+                    
+                    # Generator adversarial loss
+                    adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
+                    
+                    # Combined generator loss
+                    loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
                 
                 # Update val losses
                 val_losses['total_g'] += loss_g.item()
@@ -378,8 +510,11 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
                 val_losses['adv_g'] += adv_loss.item()
                 val_losses['adv_d'] += loss_d.item()
                 
-                # Save some validation reconstructions
+                # Save some validation reconstructions (only for first batch)
                 if i == 0:
+                    # Save a limited number of images to save memory
+                    n_samples = min(4, images.shape[0])
+                    
                     reconstructions_path = os.path.join(
                         batch_results_folder, 
                         'reconstructions', 
@@ -387,8 +522,8 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
                     )
                     
                     # Combine original and reconstructed images
-                    comparison = torch.cat([images[:8], reconstructions[:8]], dim=0)
-                    grid = save_image_grid(comparison, reconstructions_path, nrow=8, value_range=(0, 1))
+                    comparison = torch.cat([images[:n_samples], reconstructions[:n_samples]], dim=0)
+                    grid = save_image_grid(comparison, reconstructions_path, nrow=n_samples, value_range=(0, 1))
                     writer.add_image(f'val/reconstructions', grid, epoch)
                     
                     # Save codebook usage visualization
@@ -407,6 +542,10 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
                         writer.add_scalar('codebook/usage_entropy', 
                                           -(usage / usage.sum() * np.log(usage / usage.sum() + 1e-10)).sum(), 
                                           epoch)
+                
+                # Close any matplotlib figures and clear memory
+                plt.close('all')
+                torch.cuda.empty_cache() if device.type == 'cuda' else None
         
         # Calculate average val losses
         for key in val_losses:
@@ -435,9 +574,15 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
             # Save generator
             checkpoint_path = os.path.join(checkpoint_dir, f'batch_{batch_idx}_best_model_gan.pt')
             torch.save(model.state_dict(), checkpoint_path)
+            
+            # Also save to the main best model path for testing
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_model_gan.pt"))
+            
             # Save discriminator
             discriminator_path = os.path.join(checkpoint_dir, f'batch_{batch_idx}_best_discriminator.pt')
             torch.save(discriminator.state_dict(), discriminator_path)
+            torch.save(discriminator.state_dict(), os.path.join(checkpoint_dir, "best_discriminator.pt"))
+            
             print(f"  New best model saved at {checkpoint_path}")
             
         # Save regular checkpoint
@@ -452,6 +597,10 @@ def train_vqgan_stage2(model, discriminator, train_loader, val_loader, device, b
     torch.save(model.state_dict(), final_checkpoint_path)
     final_discriminator_path = os.path.join(checkpoint_dir, f'batch_{batch_idx}_final_discriminator.pt')
     torch.save(discriminator.state_dict(), final_discriminator_path)
+    
+    # Ensure we clean up before returning
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+    plt.close('all')
     
     return model, discriminator, best_val_loss
 
@@ -479,27 +628,48 @@ def evaluate_on_test_set(model, discriminator, test_loader, device, results_fold
     }
     all_codebook_indices = []
     
+    # Use mixed precision for evaluation if available
     with torch.no_grad():
         for i, (images, metadata) in enumerate(tqdm(test_loader, desc="Evaluating on test set")):
             images = images.to(device)
             batch_size = images.size(0)
             
-            # Forward pass
-            reconstructions, quantized, vq_loss, perceptual, indices = model(
-                images, return_perceptual=True, return_indices=True
-            )
-            
-            # Calculate losses
-            recon_loss = F.mse_loss(reconstructions, images)
-            p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0)
-            
-            # Adversarial evaluation
-            fake_preds = discriminator(reconstructions)
-            real_targets = torch.ones_like(fake_preds)
-            adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
-            
-            # Combined loss
-            loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
+            # Use mixed precision for memory efficiency
+            if device.type == 'cuda':
+                with torch.cuda.amp.autocast():
+                    # Forward pass
+                    reconstructions, quantized, vq_loss, perceptual, indices = model(
+                        images, return_perceptual=True, return_indices=True
+                    )
+                    
+                    # Calculate losses
+                    recon_loss = F.mse_loss(reconstructions, images)
+                    p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                    
+                    # Adversarial evaluation
+                    fake_preds = discriminator(reconstructions)
+                    real_targets = torch.ones_like(fake_preds)
+                    adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
+                    
+                    # Combined loss
+                    loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
+            else:
+                # Forward pass without mixed precision
+                reconstructions, quantized, vq_loss, perceptual, indices = model(
+                    images, return_perceptual=True, return_indices=True
+                )
+                
+                # Calculate losses
+                recon_loss = F.mse_loss(reconstructions, images)
+                p_loss = perceptual_loss(reconstructions, images).mean() if perceptual_weight > 0 else torch.tensor(0.0, device=device)
+                
+                # Adversarial evaluation
+                fake_preds = discriminator(reconstructions)
+                real_targets = torch.ones_like(fake_preds)
+                adv_loss = F.binary_cross_entropy_with_logits(fake_preds, real_targets)
+                
+                # Combined loss
+                loss_g = recon_loss + vq_loss + perceptual_weight * p_loss + adv_weight * adv_loss
             
             # Update test losses
             test_losses['total_g'] += loss_g.item() * batch_size
@@ -509,10 +679,15 @@ def evaluate_on_test_set(model, discriminator, test_loader, device, results_fold
             test_losses['adv_g'] += adv_loss.item() * batch_size
             
             # Collect codebook indices for analysis
-            all_codebook_indices.append(indices.cpu())
+            # Only store if small enough to avoid memory issues
+            if i < 5:
+                all_codebook_indices.append(indices.cpu())
             
-            # Save reconstructions for visualization
-            if i < 10:  # Save first 10 batches for visualization
+            # Save reconstructions for visualization (limited to 5 batches to save memory)
+            if i < 5:
+                # Only use a small subset of images
+                n_samples = min(4, images.shape[0])
+                
                 reconstructions_path = os.path.join(
                     results_folder, 
                     'test_reconstructions', 
@@ -520,8 +695,12 @@ def evaluate_on_test_set(model, discriminator, test_loader, device, results_fold
                 )
                 
                 # Combine original and reconstructed images
-                comparison = torch.cat([images[:8], reconstructions[:8]], dim=0)
-                save_image_grid(comparison, reconstructions_path, nrow=8, value_range=(0, 1))
+                comparison = torch.cat([images[:n_samples], reconstructions[:n_samples]], dim=0)
+                save_image_grid(comparison, reconstructions_path, nrow=n_samples, value_range=(0, 1))
+            
+            # Clean up to prevent memory issues
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+            plt.close('all')
     
     # Calculate average test losses
     num_samples = len(test_loader.dataset)
@@ -549,5 +728,9 @@ def evaluate_on_test_set(model, discriminator, test_loader, device, results_fold
         print(f"  Codebook statistics:")
         print(f"    Active entries: {num_active}/{model.num_embeddings} ({num_active/model.num_embeddings*100:.1f}%)")
         print(f"    Usage entropy: {usage_entropy:.4f}")
+    
+    # Clean up before returning
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+    plt.close('all')
     
     return test_losses['total_g'], test_losses['recon'], test_losses['vq'], usage

@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import sys
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to prevent tkinter issues
 import matplotlib.pyplot as plt
 from PIL import Image
 import torchvision.transforms as transforms
